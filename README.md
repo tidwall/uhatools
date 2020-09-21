@@ -30,7 +30,7 @@ cl.Release()
 
 Get a connection from the Cluster pool. The connection will automatically track
 the leadership changes. It's api is modeled after the
-[redigo](github.com/gomodule/redigo) project.
+[redigo](https://github.com/gomodule/redigo) project.
 
 ```go
 conn := cl.Get()
