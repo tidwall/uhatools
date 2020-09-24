@@ -92,7 +92,9 @@ func (cl *Cluster) Get() *Conn {
 	if cl.pool.Len() == 0 {
 		return &Conn{cl: cl}
 	}
-	return (*Conn)(cl.pool.DeleteMax().(*connItem))
+	c := (*Conn)(cl.pool.DeleteMax().(*connItem))
+	c.released = false
+	return c
 }
 
 func (cl *Cluster) getConnectionInfo(leader bool) (addr, auth string,
