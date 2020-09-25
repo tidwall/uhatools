@@ -5,11 +5,13 @@ import (
 )
 
 func TestClient(t *testing.T) {
-	cl := NewCluster(ClusterOptions{
-		Addresses: []string{":11001", ":11002"},
-		Auth:      "hello",
+	cl := NewPool(PoolOptions{
+		InitialServers: []string{":11001", ":11002"},
+		DialOptions: DialOptions{
+			Auth: "hello",
+		},
 	})
-	defer cl.Release()
+	defer cl.Close()
 	c := cl.Get()
-	defer c.Release()
+	defer c.Close()
 }

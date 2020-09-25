@@ -11,16 +11,15 @@ import (
 	"time"
 
 	"github.com/gomodule/redigo/redis"
-	"github.com/google/btree"
 )
 
 var defaultLeadershipTimeout = time.Second * 20
 var defaultConnectionTimeout = time.Second * 5
-var defaultRetryTimeout = time.Millisecond * 100
-var defaultPoolSize = 3
+var defaultRetryTimeout = time.Millisecond * 250
+var defaultPoolSize = 20
 
-// ErrConnectionReleased is returned when a Uhaha connection has been released.
-var ErrConnectionReleased = errors.New("connection released")
+// ErrClosed is returned when a Uhaha connection has been closed.
+var ErrClosed = errors.New("closed")
 
 // ErrLeadershipTimeout is returned when a conenction to a Uhaha leader could
 // not be established within the required time.
@@ -30,194 +29,159 @@ var ErrLeadershipTimeout = errors.New("leadership timeout")
 // not be established within the required time.
 var ErrConnectionTimeout = errors.New("connection timeout")
 
-// Cluster represents a Uhaha cluster
-type Cluster struct {
-	mu       sync.RWMutex
-	opts     ClusterOptions
-	released bool
-	pool     *btree.BTree
+// Pool represents a Uhaha connection pool
+type Pool struct {
+	opts   PoolOptions
+	mu     sync.Mutex
+	closed bool
+	conns  []*Conn
 }
 
-// ClusterOptions are provide to NewCluster.
-type ClusterOptions struct {
-	Addresses         []string      // required: one or more
-	Auth              string        // optional
-	TLSConfig         *tls.Config   // optional
-	PoolSize          int           // default: 15
-	ConnectionTimeout time.Duration // default: 5s
-	LeadershipTimeout time.Duration // default: 20s
+// PoolOptions are provide to NewPool.
+type PoolOptions struct {
+	DialOptions             // The Dial Options for each connection
+	InitialServers []string // The initial cluster server addresses
+	PoolSize       int      // Max number of connection in pool. default: 15
 }
 
-// NewCluster defines a new Cluster
-func NewCluster(opts ClusterOptions) *Cluster {
-	cl := new(Cluster)
-	cl.opts = opts
-	cl.opts.Addresses = append([]string{}, opts.Addresses...)
-	if cl.opts.TLSConfig != nil {
-		cl.opts.TLSConfig = cl.opts.TLSConfig.Clone()
+// NewPool returns a new Uhaha pool
+func NewPool(opts PoolOptions) *Pool {
+	if len(opts.InitialServers) == 0 {
+		panic("empty server list")
 	}
-	if cl.opts.PoolSize == 0 {
-		cl.opts.PoolSize = defaultPoolSize
+	if opts.PoolSize == 0 {
+		opts.PoolSize = defaultPoolSize
 	}
-	if cl.opts.ConnectionTimeout == 0 {
-		cl.opts.ConnectionTimeout = defaultConnectionTimeout
+	if opts.TLSConfig != nil {
+		opts.TLSConfig = opts.TLSConfig.Clone()
 	}
-	if cl.opts.LeadershipTimeout == 0 {
-		cl.opts.LeadershipTimeout = defaultLeadershipTimeout
+	if opts.LeadershipTimeout == 0 {
+		opts.LeadershipTimeout = defaultLeadershipTimeout
 	}
-	cl.pool = btree.New(32)
-	return cl
+	if opts.ConnectionTimeout == 0 {
+		opts.ConnectionTimeout = defaultConnectionTimeout
+	}
+	return &Pool{opts: opts}
 }
 
-// Release a cluster and close and pooled connection
-func (cl *Cluster) Release() {
-	cl.mu.Lock()
-	defer cl.mu.Unlock()
-	if cl.released {
-		return
+// Get a connection from the pool.
+func (p *Pool) Get() *Conn {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return &Conn{closed: true}
 	}
-	for cl.pool.Len() > 0 {
-		(*Conn)(cl.pool.DeleteMax().(*connItem)).Release()
+	for len(p.conns) > 0 {
+		// borrow
+		c := p.conns[len(p.conns)-1]
+		p.conns[len(p.conns)-1] = nil
+		p.conns = p.conns[:len(p.conns)-1]
+		c.closed = false
+		pong, err := redis.String(c.conn.Do("PING"))
+		if err == nil && pong == "PONG" {
+			return c
+		}
 	}
-	cl.released = true
+	return &Conn{
+		pool:    p,
+		servers: p.opts.InitialServers,
+		opts:    p.opts.DialOptions,
+	}
 }
 
-// Get a connection from the Cluster pool.
-func (cl *Cluster) Get() *Conn {
-	cl.mu.RLock()
-	defer cl.mu.RUnlock()
-	if cl.released {
-		return &Conn{released: true}
+// Close the pool and pooled connections
+func (p *Pool) Close() error {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return ErrClosed
 	}
-	if cl.pool.Len() == 0 {
-		return &Conn{cl: cl}
-	}
-	c := (*Conn)(cl.pool.DeleteMax().(*connItem))
-	c.released = false
-	return c
-}
-
-func (cl *Cluster) getConnectionInfo(leader bool) (addr, auth string,
-	tlscfg *tls.Config,
-) {
-	cl.mu.RLock()
-	defer cl.mu.RUnlock()
-	if len(cl.opts.Addresses) > 0 {
-		addr = cl.opts.Addresses[rand.Int()%len(cl.opts.Addresses)]
-	}
-	return addr, cl.opts.Auth, cl.opts.TLSConfig
-}
-
-type connItem Conn
-
-func (c *connItem) Less(item btree.Item) bool {
-	return c.lastDo.Before(item.(*connItem).lastDo)
-}
-
-// Conn represents a connection to a Uhaha Cluster
-type Conn struct {
-	released bool
-	cl       *Cluster
-	lastDo   time.Time
-	conn     redis.Conn
-}
-
-// Release a connection back to the Cluster pool. This may close the network
-// connection if the Cluster is released or there is no more room in the pool.
-func (c *Conn) Release() {
-	if c.released {
-		return
-	}
-	c.released = true
-	c.cl.mu.Lock()
-	defer c.cl.mu.Unlock()
-	if c.cl.released || c.cl.pool.Len() > c.cl.opts.PoolSize {
+	conns := p.conns
+	p.conns = nil
+	p.closed = true
+	p.mu.Unlock()
+	for _, c := range conns {
 		if c.conn != nil {
 			c.conn.Close()
 			c.conn = nil
 		}
-	} else {
-		c.cl.pool.ReplaceOrInsert((*connItem)(c))
 	}
+	return nil
 }
 
-// Do exectes a Uhaha command on the server and returns the reply or an error.
-func (c *Conn) Do(commandName string, args ...interface{}) (reply interface{},
-	err error,
-) {
-	if c.released {
-		return nil, ErrConnectionReleased
+// Conn represents a connection to a Uhaha cluster
+type Conn struct {
+	closed  bool
+	pool    *Pool
+	conn    redis.Conn
+	servers []string
+	opts    DialOptions
+}
+
+// DialOptions ...
+type DialOptions struct {
+	Auth              string        // optional
+	TLSConfig         *tls.Config   // optional
+	ConnectionTimeout time.Duration // default: 5 seconds
+	LeadershipTimeout time.Duration // default: 20 seconds
+}
+
+// Dial connects to the Uhaha cluster at the given TCP address using the
+// specified options. The addr param can be a single value or a comma-delimited
+// set of addresses, where the set represents the servers in the Uhaha cluster.
+func Dial(addr string, opts *DialOptions) (*Conn, error) {
+	var dialOpts DialOptions
+	if opts != nil {
+		dialOpts = *opts
 	}
-	var tryLeader string
-	var requireLeader bool
-	leaderStart := time.Now()
-retryCommand:
-	if time.Since(leaderStart) > c.cl.opts.LeadershipTimeout {
-		return nil, ErrLeadershipTimeout
+	if dialOpts.LeadershipTimeout == 0 {
+		dialOpts.LeadershipTimeout = defaultLeadershipTimeout
 	}
-	if c.conn == nil {
-		connectionStart := time.Now()
-	tryNewServer:
-		if time.Since(connectionStart) > c.cl.opts.ConnectionTimeout {
-			return nil, ErrConnectionTimeout
-		}
-		// open a new network connection
-		addr, auth, tlscfg := c.cl.getConnectionInfo(false)
-		if addr == "" {
-			return nil, errors.New("no addresses defined")
-		}
-		if tryLeader != "" {
-			addr, tryLeader = tryLeader, ""
-		}
-		conn, _, err := rawDial(addr, auth, tlscfg, requireLeader,
-			c.cl.opts.ConnectionTimeout)
+	if dialOpts.ConnectionTimeout == 0 {
+		dialOpts.ConnectionTimeout = defaultConnectionTimeout
+	}
+	var lerr error
+	addrs := strings.Split(addr, ",")
+	ri := rand.Int() % len(addrs)
+	for i := 0; i < len(addrs); i++ {
+		addr := addrs[(ri+i)%len(addrs)]
+		conn, servers, err := rawDial(addr, dialOpts.Auth, dialOpts.TLSConfig,
+			false, dialOpts.ConnectionTimeout)
 		if err != nil {
-			if err.Error() == "ERR node is not the leader" {
-				// requires a leader, try again
-				time.Sleep(defaultRetryTimeout)
-				goto retryCommand
-			}
-			if isNetworkError(err) {
-				// try a new server
-				time.Sleep(defaultRetryTimeout)
-				goto tryNewServer
-			}
-			return nil, err
+			lerr = err
+			continue
 		}
-		c.conn = conn
+		c := &Conn{
+			conn:    conn,
+			servers: servers,
+			opts:    dialOpts,
+		}
+		return c, nil
 	}
-	reply, err = c.conn.Do(commandName, args...)
-	if err != nil {
-		errMsg := err.Error()
-		notTheLeader := errMsg == "ERR node is not the leader"
-		if strings.HasPrefix(errMsg, "TRY ") {
-			notTheLeader = true
-			tryLeader = errMsg[4:]
-		}
-		if isNetworkError(err) || notTheLeader {
-			// reset the connection and try a new server
-			c.conn.Close()
-			c.conn = nil
-			if notTheLeader {
-				requireLeader = true
-			}
-			time.Sleep(defaultRetryTimeout)
-			goto retryCommand
-		}
-		return nil, err
-	}
-	c.lastDo = time.Now()
-	return reply, nil
+	return nil, lerr
 }
 
-func isNetworkError(err error) bool {
-	if err == io.EOF || err == io.ErrUnexpectedEOF {
-		return true
+// Close a connection
+func (c *Conn) Close() error {
+	if c.closed {
+		return ErrClosed
 	}
-	if _, ok := err.(net.Error); ok {
-		return true
+	c.closed = true
+	if c.conn == nil {
+		return nil
 	}
-	return false
+	if c.pool != nil {
+		c.pool.mu.Lock()
+		if !c.pool.closed && len(c.pool.conns) < c.pool.opts.PoolSize {
+			c.pool.conns = append(c.pool.conns, c)
+			c.pool.mu.Unlock()
+			return nil
+		}
+		c.pool.mu.Unlock()
+	}
+	c.conn.Close()
+	c.conn = nil
+	return nil
 }
 
 func rawDial(addr, auth string, tlscfg *tls.Config, requireLeader bool,
@@ -273,7 +237,11 @@ func rawDial(addr, auth string, tlscfg *tls.Config, requireLeader bool,
 				return err
 			}
 			if m["state"] != "Leader" {
-				return errors.New("ERR node is not the leader")
+				leader, err := redis.String(conn.Do("raft", "leader"))
+				if err != nil || leader == "" {
+					return errors.New("ERR node is not the leader")
+				}
+				return errors.New("TRY " + leader)
 			}
 		}
 		return nil
@@ -282,6 +250,111 @@ func rawDial(addr, auth string, tlscfg *tls.Config, requireLeader bool,
 		return nil, nil, err
 	}
 	return conn, servers, nil
+}
+
+// Do exectes a Uhaha command on the server and returns the reply or an error.
+func (c *Conn) Do(commandName string, args ...interface{}) (reply interface{},
+	err error,
+) {
+	if c.closed {
+		return nil, ErrClosed
+	}
+	var tryLeader string
+	var requireLeader bool
+	leaderStart := time.Now()
+retryCommand:
+	if time.Since(leaderStart) > c.opts.LeadershipTimeout {
+		if c.conn != nil {
+			c.conn.Close()
+			c.conn = nil
+		}
+		return nil, ErrLeadershipTimeout
+	}
+	if c.conn == nil {
+		connectionStart := time.Now()
+	tryNewServer:
+		if time.Since(connectionStart) > c.opts.ConnectionTimeout {
+			if c.conn != nil {
+				c.conn.Close()
+				c.conn = nil
+			}
+			return nil, ErrConnectionTimeout
+		}
+		// open a new network connection
+		var addr string
+		if tryLeader != "" {
+			// use the request leader
+			addr, tryLeader = tryLeader, ""
+		} else {
+			// choose a random server
+			addr = c.servers[rand.Int()%len(c.servers)]
+		}
+		if addr == "" {
+			return nil, errors.New("no server address")
+		}
+		rconn, servers, err := rawDial(addr, c.opts.Auth, c.opts.TLSConfig,
+			requireLeader, c.opts.ConnectionTimeout)
+		if err != nil {
+			if isNetworkError(err) {
+				// just try a new server
+				time.Sleep(defaultRetryTimeout)
+				goto tryNewServer
+			}
+			if isLeadershipError(err) {
+				// requires a leader, try again
+				if strings.HasPrefix(err.Error(), "TRY ") {
+					requireLeader = true
+					tryLeader = err.Error()[4:]
+				}
+				time.Sleep(defaultRetryTimeout)
+				goto retryCommand
+			}
+			return nil, err
+		}
+		c.conn = rconn
+		c.servers = servers
+	}
+	reply, err = c.conn.Do(commandName, args...)
+	if err != nil {
+		if isNetworkError(err) || isLeadershipError(err) {
+			// reset the connection and try a new server
+			c.conn.Close()
+			c.conn = nil
+			if strings.HasPrefix(err.Error(), "TRY ") {
+				requireLeader = true
+				tryLeader = err.Error()[4:]
+			}
+			time.Sleep(defaultRetryTimeout)
+			goto retryCommand
+		}
+		return nil, err
+	}
+	return reply, nil
+}
+
+func isNetworkError(err error) bool {
+	if err == io.EOF || err == io.ErrUnexpectedEOF {
+		return true
+	}
+	if _, ok := err.(net.Error); ok {
+		return true
+	}
+	return false
+}
+
+func isLeadershipError(err error) bool {
+	errmsg := err.Error()
+	switch {
+	case strings.HasPrefix(errmsg, "TRY "):
+		return true
+	case errmsg == "ERR node is not the leader":
+		return true
+	case errmsg == "ERR leadership lost while committing log":
+		return true
+	case errmsg == "ERR leadership transfer in progress":
+		return true
+	}
+	return false
 }
 
 // ErrNil indicates that a reply value is nil.
