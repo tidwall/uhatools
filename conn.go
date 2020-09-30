@@ -140,6 +140,10 @@ func Dial(addr string, opts *DialOptions) (*Conn, error) {
 	if dialOpts.ConnectionTimeout == 0 {
 		dialOpts.ConnectionTimeout = defaultConnectionTimeout
 	}
+	if dialOpts.TLSConfig != nil {
+		dialOpts.TLSConfig = dialOpts.TLSConfig.Clone()
+	}
+
 	var lerr error
 	addrs := strings.Split(addr, ",")
 	ri := rand.Int() % len(addrs)
@@ -189,7 +193,7 @@ func rawDial(addr, auth string, tlscfg *tls.Config, requireLeader bool,
 ) {
 	var opts []redis.DialOption
 	if tlscfg != nil {
-		opts = append(opts, redis.DialTLSConfig(tlscfg.Clone()))
+		opts = append(opts, redis.DialUseTLS(true), redis.DialTLSConfig(tlscfg))
 	}
 	opts = append(opts, redis.DialConnectTimeout(connTimeout))
 	conn, err = redis.Dial("tcp", addr, opts...)
