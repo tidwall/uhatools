@@ -46,9 +46,6 @@ type PoolOptions struct {
 
 // NewPool returns a new Uhaha pool
 func NewPool(opts PoolOptions) *Pool {
-	if len(opts.InitialServers) == 0 {
-		panic("empty server list")
-	}
 	if opts.PoolSize == 0 {
 		opts.PoolSize = defaultPoolSize
 	}
@@ -291,6 +288,9 @@ retryCommand:
 			addr, tryLeader = tryLeader, ""
 		} else {
 			// choose a random server
+			if len(c.servers) == 0 {
+				return nil, errors.New("no servers provided")
+			}
 			addr = c.servers[rand.Int()%len(c.servers)]
 		}
 		if addr == "" {
