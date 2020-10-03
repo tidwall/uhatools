@@ -199,14 +199,6 @@ func rawDial(addr, auth string, tlscfg *tls.Config, requireLeader bool,
 	}
 	// do some handshaking stuff
 	if err := func() (err error) {
-		// talk to the server
-		pong, err := redis.String(conn.Do("PING"))
-		if err != nil {
-			return err
-		}
-		if pong != "PONG" {
-			return errors.New("expected 'PONG'")
-		}
 		// authenticate
 		if auth != "" {
 			ok, err := redis.String(conn.Do("AUTH", auth))
@@ -216,6 +208,14 @@ func rawDial(addr, auth string, tlscfg *tls.Config, requireLeader bool,
 			if ok != "OK" {
 				return errors.New("expected 'OK'")
 			}
+		}
+		// talk to the server
+		pong, err := redis.String(conn.Do("PING"))
+		if err != nil {
+			return err
+		}
+		if pong != "PONG" {
+			return errors.New("expected 'PONG'")
 		}
 		// get server list
 		vv, err := redis.Values(conn.Do("raft", "server", "list"))
