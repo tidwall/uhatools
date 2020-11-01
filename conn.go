@@ -29,23 +29,23 @@ var ErrLeadershipTimeout = errors.New("leadership timeout")
 // not be established within the required time.
 var ErrConnectionTimeout = errors.New("connection timeout")
 
-// Pool represents a Uhaha connection pool
-type Pool struct {
-	opts   PoolOptions
+// Cluster represents a Uhaha connection cluster and pool
+type Cluster struct {
+	opts   ClusterOptions
 	mu     sync.Mutex
 	closed bool
 	conns  []*Conn
 }
 
-// PoolOptions are provide to NewPool.
-type PoolOptions struct {
+// ClusterOptions are provide to OpenCluster.
+type ClusterOptions struct {
 	DialOptions             // The Dial Options for each connection
 	InitialServers []string // The initial cluster server addresses
 	PoolSize       int      // Max number of connection in pool. default: 15
 }
 
-// NewPool returns a new Uhaha pool
-func NewPool(opts PoolOptions) *Pool {
+// OpenCluster returns a new Uhaha Cluster connection pool
+func OpenCluster(opts ClusterOptions) *Cluster {
 	if opts.PoolSize == 0 {
 		opts.PoolSize = defaultPoolSize
 	}
@@ -58,21 +58,21 @@ func NewPool(opts PoolOptions) *Pool {
 	if opts.ConnectionTimeout == 0 {
 		opts.ConnectionTimeout = defaultConnectionTimeout
 	}
-	return &Pool{opts: opts}
+	return &Cluster{opts: opts}
 }
 
-// Get a connection from the pool.
-func (p *Pool) Get() *Conn {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.closed {
+// Get a connection from the Cluster.
+func (cl *Cluster) Get() *Conn {
+	cl.mu.Lock()
+	defer cl.mu.Unlock()
+	if cl.closed {
 		return &Conn{closed: true}
 	}
-	for len(p.conns) > 0 {
+	for len(cl.conns) > 0 {
 		// borrow
-		c := p.conns[len(p.conns)-1]
-		p.conns[len(p.conns)-1] = nil
-		p.conns = p.conns[:len(p.conns)-1]
+		c := cl.conns[len(cl.conns)-1]
+		cl.conns[len(cl.conns)-1] = nil
+		cl.conns = cl.conns[:len(cl.conns)-1]
 		c.closed = false
 		pong, err := redis.String(c.conn.Do("PING"))
 		if err == nil && pong == "PONG" {
@@ -80,23 +80,23 @@ func (p *Pool) Get() *Conn {
 		}
 	}
 	return &Conn{
-		pool:    p,
-		servers: p.opts.InitialServers,
-		opts:    p.opts.DialOptions,
+		cluster: cl,
+		servers: cl.opts.InitialServers,
+		opts:    cl.opts.DialOptions,
 	}
 }
 
-// Close the pool and pooled connections
-func (p *Pool) Close() error {
-	p.mu.Lock()
-	if p.closed {
-		p.mu.Unlock()
+// Close the cluster and pooled connections
+func (cl *Cluster) Close() error {
+	cl.mu.Lock()
+	if cl.closed {
+		cl.mu.Unlock()
 		return ErrClosed
 	}
-	conns := p.conns
-	p.conns = nil
-	p.closed = true
-	p.mu.Unlock()
+	conns := cl.conns
+	cl.conns = nil
+	cl.closed = true
+	cl.mu.Unlock()
 	for _, c := range conns {
 		if c.conn != nil {
 			c.conn.Close()
@@ -109,7 +109,7 @@ func (p *Pool) Close() error {
 // Conn represents a connection to a Uhaha cluster
 type Conn struct {
 	closed  bool
-	pool    *Pool
+	cluster *Cluster
 	conn    redis.Conn
 	servers []string
 	opts    DialOptions
@@ -171,14 +171,14 @@ func (c *Conn) Close() error {
 	if c.conn == nil {
 		return nil
 	}
-	if c.pool != nil {
-		c.pool.mu.Lock()
-		if !c.pool.closed && len(c.pool.conns) < c.pool.opts.PoolSize {
-			c.pool.conns = append(c.pool.conns, c)
-			c.pool.mu.Unlock()
+	if c.cluster != nil {
+		c.cluster.mu.Lock()
+		if !c.cluster.closed && len(c.cluster.conns) < c.cluster.opts.PoolSize {
+			c.cluster.conns = append(c.cluster.conns, c)
+			c.cluster.mu.Unlock()
 			return nil
 		}
-		c.pool.mu.Unlock()
+		c.cluster.mu.Unlock()
 	}
 	c.conn.Close()
 	c.conn = nil

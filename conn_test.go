@@ -5,7 +5,7 @@ import (
 )
 
 func TestClient(t *testing.T) {
-	cl := NewPool(PoolOptions{
+	cl := OpenCluster(ClusterOptions{
 		InitialServers: []string{":11001", ":11002"},
 		DialOptions: DialOptions{
 			Auth: "hello",

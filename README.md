@@ -5,13 +5,13 @@
 Tools for managing [Uhaha](https://github.com/tidwall/uhaha) services.
 Right now this only has the Uhaha client library.
 
-## Create a cluster pool
+## Open a Cluster
 
-This will define a new pool that will be used for establishing connections to a
-Uhaha cluster.
+This will define a new cluster pool that will be used for establishing
+connections to a Uhaha cluster.
 
 ```go
-cl := uhatools.NewPool(uhatools.PoolOptions{
+cl := uhatools.OpenCluster(uhatools.ClusterOptions{
     InitialServers: []string { 
         "127.0.0.1:11001", // Server 1
         "127.0.0.1:11002", // Server 2
@@ -20,7 +20,7 @@ cl := uhatools.NewPool(uhatools.PoolOptions{
 })
 ```
 
-Close the pool when you don't need it anymore
+Close the Cluster when you don't need it anymore
 
 ```go
 cl.Close()
