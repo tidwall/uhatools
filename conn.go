@@ -309,6 +309,12 @@ retryCommand:
 				if strings.HasPrefix(err.Error(), "TRY ") {
 					requireLeader = true
 					tryLeader = err.Error()[4:]
+				} else if strings.HasPrefix(err.Error(), "MOVED ") {
+					parts := strings.Split(err.Error(), " ")
+					if len(parts) == 3 {
+						requireLeader = true
+						tryLeader = parts[2]
+					}
 				}
 				time.Sleep(defaultRetryTimeout)
 				goto retryCommand
@@ -327,6 +333,12 @@ retryCommand:
 			if strings.HasPrefix(err.Error(), "TRY ") {
 				requireLeader = true
 				tryLeader = err.Error()[4:]
+			} else if strings.HasPrefix(err.Error(), "MOVED ") {
+				parts := strings.Split(err.Error(), " ")
+				if len(parts) == 3 {
+					requireLeader = true
+					tryLeader = parts[2]
+				}
 			}
 			time.Sleep(defaultRetryTimeout)
 			goto retryCommand
@@ -349,6 +361,12 @@ func isNetworkError(err error) bool {
 func isLeadershipError(err error) bool {
 	errmsg := err.Error()
 	switch {
+	case strings.HasPrefix(errmsg, "MOVED "):
+		return true
+	case strings.HasPrefix(errmsg, "CLUSTERDOWN "):
+		return true
+	case strings.HasPrefix(errmsg, "TRYAGAIN "):
+		return true
 	case strings.HasPrefix(errmsg, "TRY "):
 		return true
 	case errmsg == "ERR node is not the leader":
