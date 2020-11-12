@@ -559,3 +559,27 @@ func Uint64s(reply interface{}, err error) ([]uint64, error) {
 func Uint64Map(reply interface{}, err error) (map[string]uint64, error) {
 	return redis.Uint64Map(reply, err)
 }
+
+// ValueMap is a helper that converts an array of values (alternating key,
+// value) into a map[string]interface{}.
+// Requires an even number of values in result.
+func ValueMap(reply interface{}, err error) (map[string]interface{}, error) {
+	values, err := redis.Values(reply, err)
+	if err != nil {
+		return nil, err
+	}
+	if len(values)%2 != 0 {
+		return nil, errors.New("redigo: ValueMap expects even number of " +
+			"values result")
+	}
+	m := make(map[string]interface{}, len(values)/2)
+	for i := 0; i < len(values); i += 2 {
+		key, ok := values[i].([]byte)
+		if !ok {
+			return nil, errors.New("redigo: ValueMap key not a bulk " +
+				"string value")
+		}
+		m[string(key)] = values[i+1]
+	}
+	return m, nil
+}
