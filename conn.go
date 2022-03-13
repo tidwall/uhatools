@@ -16,6 +16,7 @@ import (
 var defaultLeadershipTimeout = time.Second * 20
 var defaultConnectionTimeout = time.Second * 5
 var defaultRetryTimeout = time.Millisecond * 250
+var defaultAutoCloseStale = time.Second * 30
 var defaultPoolSize = 20
 
 // ErrClosed is returned when a Uhaha connection has been closed.
@@ -39,9 +40,10 @@ type Cluster struct {
 
 // ClusterOptions are provide to OpenCluster.
 type ClusterOptions struct {
-	DialOptions             // The Dial Options for each connection
-	InitialServers []string // The initial cluster server addresses
-	PoolSize       int      // Max number of connection in pool. default: 15
+	DialOptions                  // The Dial Options for each connection
+	InitialServers []string      // The initial cluster server addresses
+	AutoCloseStale time.Duration // Auto close conns after time. default: 60s
+	PoolSize       int           // Max number of conns in pool. default: 15
 }
 
 // OpenCluster returns a new Uhaha Cluster connection pool
@@ -58,7 +60,69 @@ func OpenCluster(opts ClusterOptions) *Cluster {
 	if opts.ConnectionTimeout == 0 {
 		opts.ConnectionTimeout = defaultConnectionTimeout
 	}
-	return &Cluster{opts: opts}
+	if opts.AutoCloseStale == 0 {
+		opts.AutoCloseStale = defaultAutoCloseStale
+	}
+	cl := &Cluster{opts: opts}
+	go cl.monitorStaleConns()
+	go cl.continualPinging()
+	return cl
+}
+
+func (cl *Cluster) monitorStaleConns() {
+	for {
+		now := time.Now()
+		var c *Conn
+		cl.mu.Lock()
+		if cl.closed {
+			cl.mu.Unlock()
+			return
+		}
+		for i := 0; i < len(cl.conns); i++ {
+			d := now.Sub(cl.conns[i].used)
+			if d > cl.opts.AutoCloseStale {
+				c = cl.conns[i]
+				cl.conns[i] = cl.conns[len(cl.conns)-1]
+				cl.conns[len(cl.conns)-1] = nil
+				cl.conns = cl.conns[:len(cl.conns)-1]
+				break
+			}
+		}
+		cl.mu.Unlock()
+		if c != nil {
+			c.conn.Close()
+		}
+		time.Sleep(time.Duration(float64(time.Second) + rand.Float64()))
+	}
+}
+
+func (cl *Cluster) continualPinging() {
+	for {
+		var c *Conn
+		cl.mu.Lock()
+		if cl.closed {
+			cl.mu.Unlock()
+			return
+		}
+		if len(cl.conns) > 0 {
+			i := rand.Int() % len(cl.conns)
+			c = cl.conns[i]
+			cl.conns[i] = cl.conns[len(cl.conns)-1]
+			cl.conns[len(cl.conns)-1] = nil
+			cl.conns = cl.conns[:len(cl.conns)-1]
+			c.closed = false
+		}
+		cl.mu.Unlock()
+		if c != nil {
+			pong, err := redis.String(c.Do("PING"))
+			if err == nil && pong == "PONG" {
+				c.Close() // put back in pool
+			} else {
+				c.conn.Close() // close and forget
+			}
+		}
+		time.Sleep(time.Duration(float64(time.Second) + rand.Float64()))
+	}
 }
 
 // Get a connection from the Cluster.
@@ -74,15 +138,13 @@ func (cl *Cluster) Get() *Conn {
 		cl.conns[len(cl.conns)-1] = nil
 		cl.conns = cl.conns[:len(cl.conns)-1]
 		c.closed = false
-		pong, err := redis.String(c.conn.Do("PING"))
-		if err == nil && pong == "PONG" {
-			return c
-		}
+		return c
 	}
 	return &Conn{
 		cluster: cl,
 		servers: cl.opts.InitialServers,
 		opts:    cl.opts.DialOptions,
+		used:    time.Now(),
 	}
 }
 
@@ -113,6 +175,7 @@ type Conn struct {
 	conn    redis.Conn
 	servers []string
 	opts    DialOptions
+	used    time.Time // last used
 }
 
 // DialOptions ...
@@ -140,7 +203,6 @@ func Dial(addr string, opts *DialOptions) (*Conn, error) {
 	if dialOpts.TLSConfig != nil {
 		dialOpts.TLSConfig = dialOpts.TLSConfig.Clone()
 	}
-
 	var lerr error
 	addrs := strings.Split(addr, ",")
 	ri := rand.Int() % len(addrs)
@@ -287,7 +349,7 @@ retryCommand:
 			// use the request leader
 			addr, tryLeader = tryLeader, ""
 		} else {
-			// choose a random server
+			// choose a random server (can we know which one from the cluster?)
 			if len(c.servers) == 0 {
 				return nil, errors.New("no servers provided")
 			}
@@ -345,6 +407,7 @@ retryCommand:
 		}
 		return nil, err
 	}
+	c.used = time.Now()
 	return reply, nil
 }
 
