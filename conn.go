@@ -315,6 +315,29 @@ func rawDial(addr, auth string, tlscfg *tls.Config, requireLeader bool,
 	return conn, servers, nil
 }
 
+// Downgrade returns a "downgraded" connection that is a direct connection
+// using redigo connection.
+// Param "requireLeader" performs a "BARRIER" command to ensure that
+// the returned connection belongs to a leader.
+func (c *Conn) Downgrade(requireLeader bool) (redis.Conn, error) {
+	var err error
+	if requireLeader {
+		_, err = redis.String(c.Do("BARRIER"))
+	} else {
+		_, err = redis.String(c.Do("PING"))
+	}
+	if err != nil {
+		return nil, err
+	}
+	conn := c.conn
+	// Mark the connection as closed, even though we are really not closed, so
+	// that the pool won't reuse it when c.Close() is called.
+	c.closed = true
+	c.conn = nil
+	c.cluster = nil
+	return conn, nil
+}
+
 // Do exectes a Uhaha command on the server and returns the reply or an error.
 func (c *Conn) Do(commandName string, args ...interface{}) (reply interface{},
 	err error,
