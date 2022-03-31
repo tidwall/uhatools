@@ -90,7 +90,9 @@ func (cl *Cluster) monitorStaleConns() {
 		}
 		cl.mu.Unlock()
 		if c != nil {
-			c.conn.Close()
+			if c.conn != nil {
+				c.conn.Close()
+			}
 		}
 		time.Sleep(time.Duration(float64(time.Second) + rand.Float64()))
 	}
@@ -118,7 +120,9 @@ func (cl *Cluster) continualPinging() {
 			if err == nil && pong == "PONG" {
 				c.Close() // put back in pool
 			} else {
-				c.conn.Close() // close and forget
+				if c.conn != nil {
+					c.conn.Close() // close and forget
+				}
 			}
 		}
 		time.Sleep(time.Duration(float64(time.Second) + rand.Float64()))
